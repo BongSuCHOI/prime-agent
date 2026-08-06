@@ -353,6 +353,11 @@ export type AgentSessionEvent =
 			finalError?: string;
 	  }
 	| {
+			type: "cost_limit_reached";
+			totalUsd: number;
+			limitUsd: number;
+	  }
+	| {
 			type: "auth_stale";
 			provider: string;
 			sourceTokens?: readonly AuthSourceToken[];
@@ -1141,6 +1146,11 @@ export class AgentSession {
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
 	private _branchSummaryOperation: Promise<void> | undefined = undefined;
+
+	// Session cost ceiling state: own turns plus usage attributed from subagents,
+	// monotonic across compaction (unlike getSessionStats(), which re-reads messages).
+	private _sessionCostUsd = 0;
+	private _costLimitNotified = false;
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
@@ -3503,6 +3513,7 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
+				this._accumulateSessionCost(assistantMsg.usage.cost.total);
 				if (assistantMsg.stopReason !== "error") {
 					addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 				}
@@ -9599,6 +9610,18 @@ export class AgentSession {
 				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth})`,
 			);
 		}
+		const maxChildren = this.settingsManager.getRlmMaxChildren();
+		if (maxChildren !== "off" && this._activeRlmChildRuns.size >= maxChildren) {
+			throw new Error(
+				`RLM concurrent subagent limit reached (${this._activeRlmChildRuns.size} active, limit ${maxChildren}). Wait for running children to finish, or raise the "rlmMaxChildren" setting.`,
+			);
+		}
+		const costLimitUsd = this._sessionCostLimitUsd();
+		if (costLimitUsd !== undefined && this._isSessionCostLimitReached()) {
+			throw new Error(
+				`Session cost limit reached ($${this._sessionCostUsd.toFixed(2)} of $${costLimitUsd.toFixed(2)} budget.maxSessionCostUsd); refusing to spawn a subagent.`,
+			);
+		}
 		if (requestedSessionName) {
 			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
 				throw new Error(formatAgentSessionNameUnavailable(requestedSessionName, this._rlmDepth + 1));
@@ -9734,6 +9757,9 @@ export class AgentSession {
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
+						// Count every child turn against the session cost ceiling, including
+						// errored/aborted ones the attribution records below skip.
+						this._accumulateSessionCost(assistant.usage.cost.total);
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
@@ -9941,6 +9967,43 @@ export class AgentSession {
 	}
 
 	// =========================================================================
+	// Session Cost Ceiling
+	// =========================================================================
+
+	/** True when budget.maxSessionCostUsd is set and this session's accumulated cost has reached it. */
+	get isCostLimited(): boolean {
+		return this._isSessionCostLimitReached();
+	}
+
+	private _sessionCostLimitUsd(): number | undefined {
+		return this.settingsManager.getBudgetSettings().maxSessionCostUsd;
+	}
+
+	private _isSessionCostLimitReached(): boolean {
+		const limit = this._sessionCostLimitUsd();
+		return limit !== undefined && this._sessionCostUsd >= limit;
+	}
+
+	private _accumulateSessionCost(costUsd: number): void {
+		if (!(costUsd > 0)) return;
+		this._sessionCostUsd += costUsd;
+		this._enforceSessionCostLimit();
+	}
+
+	private _enforceSessionCostLimit(): void {
+		const limit = this._sessionCostLimitUsd();
+		if (limit === undefined || this._sessionCostUsd < limit) return;
+		if (!this._costLimitNotified) {
+			this._costLimitNotified = true;
+			this._emit({ type: "cost_limit_reached", totalUsd: this._sessionCostUsd, limitUsd: limit });
+		}
+		// Hard stop: abort the running turn and cancel subagents. A turn started
+		// after the ceiling tripped is re-aborted on its first model response, so
+		// nothing runs to completion until the limit is raised.
+		void this.abort().catch(() => undefined);
+	}
+
+	// =========================================================================
 	// Auto-Retry
 	// =========================================================================
 
@@ -9963,11 +10026,28 @@ export class AgentSession {
 			return false;
 		}
 
+		// Quota/credit exhaustion fails closed immediately: retrying burns paid
+		// requests against an account that cannot serve them until it changes.
+		if (this._isProviderQuotaExhausted(message)) {
+			return false;
+		}
+
+		if (this._isSessionCostLimitReached()) {
+			return false;
+		}
+
 		if (this._isStructuredPermanentProviderRetryExhausted(message)) {
 			return false;
 		}
 
 		return true;
+	}
+
+	private _isProviderQuotaExhausted(message: AssistantMessage): boolean {
+		if (this._getProviderStreamFailureKind(message) === "quota") return true;
+		return /\bquota\b|insufficient[_ ](?:quota|credits?|funds?)|credit balance|payment required|monthly (?:usage |spend(?:ing)? )?limit/i.test(
+			message.errorMessage ?? "",
+		);
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
@@ -10160,7 +10240,30 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// Honor a server-requested wait (Retry-After / retry-after-ms) when the
+		// provider sent one; fail fast when it exceeds the configured maximum.
+		const rawRetryAfterMs = this._getProviderStreamFailureDetails(message)?.retryAfterMs;
+		const retryAfterMs =
+			typeof rawRetryAfterMs === "number" && Number.isFinite(rawRetryAfterMs) && rawRetryAfterMs >= 0
+				? rawRetryAfterMs
+				: undefined;
+		// maxRetryDelayMs of 0 disables the cap (documented in docs/settings.md).
+		const { maxRetryDelayMs } = this.settingsManager.getProviderRetrySettings();
+		if (retryAfterMs !== undefined && maxRetryDelayMs > 0 && retryAfterMs > maxRetryDelayMs) {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt - 1,
+				finalError: `Provider requested a ${Math.ceil(retryAfterMs / 1000)}s wait before retrying, above the ${Math.ceil(maxRetryDelayMs / 1000)}s retry.provider.maxRetryDelayMs limit: ${message.errorMessage}`,
+			});
+			this._retryAttempt = 0;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
+		const delayMs = Math.max(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), retryAfterMs ?? 0);
 
 		this._emit({
 			type: "auto_retry_start",

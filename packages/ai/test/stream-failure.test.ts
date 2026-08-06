@@ -53,6 +53,19 @@ describe("classifyStreamFailure", () => {
 	])("classifies %s / %s as %s", (type, status, expected) => {
 		expect(classifyStreamFailure(type, status)).toBe(expected);
 	});
+
+	test.each([
+		["insufficient_quota", undefined, "quota"],
+		["quota_exceeded", undefined, "quota"],
+		["usage_limit_reached", undefined, "quota"],
+		[undefined, 402, "quota"],
+		// Quota language wins over a 429 status: exhaustion is permanent, throttling is not.
+		["You have exceeded your monthly premium request quota", 429, "quota"],
+		// A bare 429 with no quota language stays transient.
+		[undefined, 429, "rate_limit"],
+	])("classifies quota exhaustion %s / %s as %s", (type, status, expected) => {
+		expect(classifyStreamFailure(type, status)).toBe(expected);
+	});
 });
 
 describe("streamFailureFromStopReason", () => {
@@ -105,6 +118,27 @@ describe("extractStreamFailureInfo", () => {
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
+	});
+
+	test("extracts Retry-After delta-seconds into retryAfterMs", () => {
+		const sdkError = Object.assign(new Error("429 rate limited"), {
+			status: 429,
+			headers: { "retry-after": "30" },
+		});
+		expect(extractStreamFailureInfo(sdkError)).toMatchObject({ kind: "rate_limit", retryAfterMs: 30000 });
+	});
+
+	test("prefers retry-after-ms over retry-after", () => {
+		const sdkError = Object.assign(new Error("429 rate limited"), {
+			status: 429,
+			headers: { "retry-after-ms": "1500", "retry-after": "30" },
+		});
+		expect(extractStreamFailureInfo(sdkError).retryAfterMs).toBe(1500);
+	});
+
+	test("omits retryAfterMs when headers carry none", () => {
+		const sdkError = Object.assign(new Error("429 rate limited"), { status: 429, headers: {} });
+		expect(extractStreamFailureInfo(sdkError).retryAfterMs).toBeUndefined();
 	});
 });
 

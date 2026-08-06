@@ -180,6 +180,15 @@ export function formatContextTree(root: ContextTreeNode, width: number): string 
 		lines.push("");
 		lines.push(theme.bold("Cost"));
 		lines.push(`${theme.fg("dim", "Total:")} $${totals.cost.total.toFixed(4)}`);
+		if (root.model?.provider === "github-copilot") {
+			lines.push(
+				theme.fg(
+					"dim",
+					"Estimate from vendor per-token list prices. GitHub Copilot meters premium requests instead;",
+				),
+			);
+			lines.push(theme.fg("dim", "its dashboard can report several times this value for cache-heavy sessions."));
+		}
 	}
 
 	const rootContext = root.contextUsage;

@@ -111,10 +111,27 @@ The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
-| `retry.provider.maxRetries` | number | SDK default | Provider/SDK retry attempts |
+| `retry.provider.maxRetries` | number | `1` | Provider/SDK-internal retry attempts per agent-level attempt |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
 
-When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
+When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap. When the provider sends a shorter `Retry-After`, the agent-level backoff waits at least that long before the next attempt.
+
+Quota and credit exhaustion (e.g., HTTP 402, `insufficient_quota`, "premium request quota exceeded") is never retried: the turn fails immediately so a daemon session cannot keep issuing paid requests against an exhausted account.
+
+### Budget
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `budget.maxSessionCostUsd` | number | unset | Hard ceiling in USD for a session's accumulated cost (own turns plus usage attributed from spawned subagents). When crossed, the session aborts running work, cancels subagents, refuses auto-retries and new subagent spawns, and scheduled heartbeat prompts are skipped until the limit is raised. |
+
+Displayed costs are computed from vendor per-token list prices. Providers that meter differently (GitHub Copilot bills premium requests) can report higher gross usage on their own dashboards, so set the ceiling conservatively for those providers.
+
+### Subagents
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `rlmMaxDepth` | number | `1` | Maximum subagent recursion depth for new sessions |
+| `rlmMaxChildren` | number \| `"off"` | `10` | Maximum concurrent direct subagents per session; `"off"` disables the cap |
 
 ```json
 {

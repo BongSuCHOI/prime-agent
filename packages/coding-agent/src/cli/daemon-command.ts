@@ -1466,6 +1466,13 @@ class DaemonAttachTerminal {
 			case "auto_retry_end":
 				this.writeLine(chalk.dim(event.success ? "Retry succeeded." : `Retry failed: ${event.finalError ?? ""}`));
 				return;
+			case "cost_limit_reached":
+				this.writeLine(
+					chalk.red(
+						`Session cost limit reached: $${event.totalUsd.toFixed(2)} of $${event.limitUsd.toFixed(2)} (budget.maxSessionCostUsd); work aborted and subagents cancelled.`,
+					),
+				);
+				return;
 			case "rlm_child_update":
 				this.writeLine(chalk.dim(`Subagent ${event.child.label}: ${event.child.status}`));
 				return;

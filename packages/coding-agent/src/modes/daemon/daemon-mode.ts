@@ -1575,6 +1575,11 @@ export class AgentDaemon {
 		if (shouldDeferHeartbeatCronJob(runnableJob, session)) {
 			return "skipped";
 		}
+		// A cost-limited session must not be re-driven by scheduled prompts; every
+		// new turn would be aborted after its first paid model response anyway.
+		if (session.isCostLimited) {
+			return "skipped";
+		}
 		const shouldQueueCronPrompt =
 			isAgentMessagePromptInProgress ||
 			session.isStreaming ||
@@ -6134,6 +6139,24 @@ export class AgentDaemon {
 			}
 			if (RECOVERY_CHECKPOINT_EVENTS.has(eventType)) {
 				this.recordWorkerRecoveryState(state, eventType);
+			}
+			// With no client attached these events would otherwise vanish; keep an
+			// operator-visible trace of silent retry storms and budget trips.
+			if (state.clients.size === 0) {
+				const event = message.event;
+				if (event.type === "auto_retry_start") {
+					this.log(
+						`session ${state.activeSessionId}: provider retry ${event.attempt}/${event.maxAttempts} in ${event.delayMs}ms with no client attached: ${event.errorMessage}`,
+					);
+				} else if (event.type === "auto_retry_end" && !event.success) {
+					this.log(
+						`session ${state.activeSessionId}: provider retries exhausted with no client attached: ${event.finalError ?? "unknown error"}`,
+					);
+				} else if (event.type === "cost_limit_reached") {
+					this.log(
+						`session ${state.activeSessionId}: cost limit reached ($${event.totalUsd.toFixed(2)} of $${event.limitUsd.toFixed(2)} budget.maxSessionCostUsd); work aborted and subagents cancelled`,
+					);
+				}
 			}
 		}
 		this.stampRlmChildActiveSessionId(message);

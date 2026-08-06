@@ -13,6 +13,7 @@ export type StreamFailureKind =
 	| "safety"
 	| "overloaded"
 	| "rate_limit"
+	| "quota"
 	| "server_error"
 	| "auth"
 	| "invalid_request"
@@ -25,6 +26,8 @@ export interface StreamFailureInfo {
 	providerErrorType?: string;
 	status?: number;
 	requestId?: string;
+	/** Server-requested wait before retrying (Retry-After / retry-after-ms), in milliseconds. */
+	retryAfterMs?: number;
 	/** Truncated raw provider payload for post-mortems. */
 	raw?: string;
 }
@@ -44,6 +47,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	safety: "Response blocked by provider safety filters",
 	overloaded: "Provider overloaded",
 	rate_limit: "Provider rate limit exceeded",
+	quota: "Provider usage quota or credit exhausted",
 	server_error: "Provider server error",
 	auth: "Provider authentication failed",
 	invalid_request: "Provider rejected the request",
@@ -70,6 +74,16 @@ export function classifyStreamFailure(providerErrorType?: string, status?: numbe
 		return "safety";
 	}
 	if (type.includes("overloaded") || status === 529) return "overloaded";
+	// Quota/credit exhaustion is permanent until the account changes; classify it
+	// before rate_limit so a 429 carrying quota language is not treated as transient.
+	if (
+		/quota|insufficient[_ ]?(?:quota|credits?|funds?)|credit balance|usage[_ ]?limit|monthly[_ ]?limit|spend(?:ing)?[_ ]?limit|payment[_ ]?required|out of credits?/.test(
+			type,
+		) ||
+		status === 402
+	) {
+		return "quota";
+	}
 	if (type.includes("rate_limit") || type.includes("throttl") || status === 429) return "rate_limit";
 	if (/authentication|permission|unauthorized/.test(type) || status === 401 || status === 403) return "auth";
 	if (type.includes("invalid_request") || type.includes("not_found_error") || status === 400 || status === 404) {
@@ -112,6 +126,23 @@ const MAX_RAW_LENGTH = 2000;
 
 export function truncateRawPayload(raw: string): string {
 	return raw.length > MAX_RAW_LENGTH ? `${raw.slice(0, MAX_RAW_LENGTH)}…` : raw;
+}
+
+/** Parse retry-after-ms (milliseconds) or Retry-After (delta-seconds or HTTP-date) into milliseconds. */
+function parseRetryAfterMs(msValue: unknown, secondsValue: unknown): number | undefined {
+	if (typeof msValue === "string" || typeof msValue === "number") {
+		const ms = Number(msValue);
+		if (Number.isFinite(ms) && ms >= 0) return ms;
+	}
+	if (typeof secondsValue === "string" || typeof secondsValue === "number") {
+		const seconds = Number(secondsValue);
+		if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+		if (typeof secondsValue === "string") {
+			const untilDateMs = Date.parse(secondsValue) - Date.now();
+			if (Number.isFinite(untilDateMs) && untilDateMs > 0) return untilDateMs;
+		}
+	}
+	return undefined;
 }
 
 function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; detail?: string } {
@@ -160,12 +191,21 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 	const rawRequestId = err.requestID ?? err.request_id ?? err.$metadata?.requestId ?? headerRequestId;
 	const requestId = typeof rawRequestId === "string" ? rawRequestId : undefined;
 
+	const headerValue = (name: string): unknown =>
+		headers && typeof (headers as Headers).get === "function"
+			? (headers as Headers).get(name)
+			: headers && typeof headers === "object"
+				? (headers as Record<string, unknown>)[name]
+				: undefined;
+	const retryAfterMs = parseRetryAfterMs(headerValue("retry-after-ms"), headerValue("retry-after"));
+
 	return {
 		info: {
 			kind: classifyStreamFailure(providerErrorType ?? error.message, status),
 			providerErrorType,
 			status,
 			requestId,
+			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
 		},
 		detail: typeof bodyMessage === "string" ? bodyMessage : undefined,
 	};

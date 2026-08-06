@@ -7,6 +7,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
+export const DEFAULT_RLM_MAX_CHILDREN = 10;
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -29,8 +30,18 @@ export interface AutoRefineSettings {
 
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
+	maxRetries?: number; // SDK/provider retry attempts; default: 1 (session-level retry owns the policy)
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+}
+
+export interface BudgetSettings {
+	/**
+	 * Hard ceiling in USD for a session's accumulated cost (own turns plus usage
+	 * attributed from spawned subagents). When crossed, the session aborts running
+	 * work, cancels subagents, refuses auto-retries and new subagent spawns, and
+	 * heartbeat prompts are skipped until the limit is raised. Unset = no limit.
+	 */
+	maxSessionCostUsd?: number;
 }
 
 export interface RetrySettings {
@@ -128,6 +139,8 @@ export interface Settings {
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
+	rlmMaxChildren?: number | "off"; // max concurrent direct subagents per session; default: 10
+	budget?: BudgetSettings;
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -761,6 +774,19 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getRlmMaxChildren(): number | "off" {
+		const value: unknown = this.settings.rlmMaxChildren;
+		if (value === "off") return "off";
+		return typeof value === "number" && Number.isFinite(value) && value >= 1
+			? Math.floor(value)
+			: DEFAULT_RLM_MAX_CHILDREN;
+	}
+
+	getBudgetSettings(): { maxSessionCostUsd?: number } {
+		const value: unknown = this.settings.budget?.maxSessionCostUsd;
+		return typeof value === "number" && Number.isFinite(value) && value > 0 ? { maxSessionCostUsd: value } : {};
+	}
+
 	getIdleEvictionMinutes(): number | "off" {
 		const value: unknown = this.globalSettings.idleEvictionMinutes;
 		if (value === "off" || value === "none") return "off";
@@ -881,10 +907,13 @@ export class SettingsManager {
 		};
 	}
 
-	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
+	getProviderRetrySettings(): { timeoutMs?: number; maxRetries: number; maxRetryDelayMs: number } {
 		return {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
-			maxRetries: this.settings.retry?.provider?.maxRetries,
+			// Bound SDK-internal retries explicitly: session-level retry owns the
+			// policy, so unbounded stacking (SDK × session) cannot multiply request
+			// volume against an exhausted quota.
+			maxRetries: this.settings.retry?.provider?.maxRetries ?? 1,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
 	}

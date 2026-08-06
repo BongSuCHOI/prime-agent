@@ -5620,6 +5620,16 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "cost_limit_reached": {
+				this.stopWorkingLoader();
+				this.showError(
+					`Session cost limit reached: $${event.totalUsd.toFixed(2)} of $${event.limitUsd.toFixed(2)} (budget.maxSessionCostUsd). ` +
+						"Running work was aborted and subagents cancelled. Raise the limit in settings to continue.",
+				);
+				this.ui.requestRender();
+				break;
+			}
+
 			case "auth_stale": {
 				this.applyAuthStaleEvent(event);
 				this.ui.requestRender();
